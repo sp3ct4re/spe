@@ -6,7 +6,7 @@ import base64, hashlib, secrets, string, sqlite3, pathlib
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
-DB_PATH = "opsec_ish.db"
+DB_PATH = "specture.db"
 
 
 # --- Database helpers ---
