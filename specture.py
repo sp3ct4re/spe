@@ -1,18 +1,15 @@
 from flask import Flask, render_template_string, request, redirect, url_for, flash, jsonify
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
-from base64 import urlsafe_b64encode
-import os, sqlite3, secrets, string, json, pathlib, hashlib
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+import base64, hashlib, secrets, string, sqlite3, pathlib
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
-DB_PATH = "opsec_assistant.db"
-SALT = b'opsec_fixed_salt_please_change'  # change to random on first run if you like
+DB_PATH = "opsec_ish.db"
 
 
-# --- Simple DB helpers ---
+# --- Database helpers ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -24,7 +21,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS notes (
                     id INTEGER PRIMARY KEY,
                     title TEXT,
-                    encrypted_blob BLOB
+                    encrypted_blob TEXT
                  )''')
     c.execute('''CREATE TABLE IF NOT EXISTS threatmodel (
                     id INTEGER PRIMARY KEY,
@@ -71,32 +68,28 @@ def execute_db(q, args=()):
     conn.close()
 
 
-# --- Crypto helpers ---
-def derive_key(password: str, salt: bytes = SALT):
-    # PBKDF2 to produce a 32-byte key, base64-urlsafe for Fernet
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=200_000,
-    )
-    key = urlsafe_b64encode(kdf.derive(password.encode()))
-    return key
+# --- Encryption helpers (PyCryptodome) ---
+def derive_key(password: str):
+    """Derive 32-byte AES key from password"""
+    return hashlib.sha256(password.encode()).digest()
 
-def encrypt_note(password: str, plaintext: str) -> bytes:
+def encrypt_note(password: str, plaintext: str):
     key = derive_key(password)
-    f = Fernet(key)
-    return f.encrypt(plaintext.encode())
+    cipher = AES.new(key, AES.MODE_EAX)
+    nonce = cipher.nonce
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext.encode())
+    return base64.b64encode(nonce + tag + ciphertext).decode()
 
-def decrypt_note(password: str, token: bytes) -> str:
+def decrypt_note(password: str, token: str):
+    raw = base64.b64decode(token)
     key = derive_key(password)
-    f = Fernet(key)
-    return f.decrypt(token).decode()
+    nonce, tag, ciphertext = raw[:16], raw[16:32], raw[32:]
+    cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
+    return cipher.decrypt_and_verify(ciphertext, tag).decode()
 
 
-# --- Passphrase generator ---
+# --- Passphrase & password generator ---
 def generate_passphrase(num_words=6, separator='-'):
-    # built-in small wordlist to avoid external downloads (you can replace)
     WORDS = [
         "alpha","bravo","charlie","delta","echo","foxtrot","golf",
         "hotel","india","juliet","kilo","lima","mike","november",
@@ -114,127 +107,128 @@ def generate_random_password(length=20, use_symbols=True):
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
-# --- Routes / Views ---
+# --- HTML Template ---
 BASE_HTML = """
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>OPSEC Assistant</title>
-  <style>
-    body{font-family:Inter,Segoe UI,Arial;background:#0f1113;color:#e6edf3;padding:20px}
-    .card{background:#111217;padding:18px;border-radius:10px;margin-bottom:12px;box-shadow:0 4px 18px rgba(0,0,0,0.6)}
-    h1{margin:0 0 12px 0}
-    button, input, textarea, select{padding:8px;border-radius:6px;border:1px solid #2a2f36;background:#0f1113;color:#e6edf3}
-    .row{display:flex;gap:12px}
-    .col{flex:1}
-    label{display:block;margin-bottom:6px;color:#9fb0c8}
-    .small{font-size:0.9em;color:#aab7c6}
-    .done{opacity:0.6;text-decoration:line-through}
-    .pass{font-family:monospace;background:#0b0c0d;padding:6px;border-radius:6px;display:inline-block}
-    a {color:#6ad1ff}
-  </style>
+<meta charset="utf-8">
+<title>OPSEC Assistant iSH</title>
+<style>
+body{font-family:Inter,Segoe UI,Arial;background:#0f1113;color:#e6edf3;padding:20px}
+.card{background:#111217;padding:18px;border-radius:10px;margin-bottom:12px;box-shadow:0 4px 18px rgba(0,0,0,0.6)}
+h1{margin:0 0 12px 0}
+button,input,textarea,select{padding:8px;border-radius:6px;border:1px solid #2a2f36;background:#0f1113;color:#e6edf3}
+.row{display:flex;gap:12px;flex-wrap:wrap}
+.col{flex:1;min-width:250px}
+label{display:block;margin-bottom:6px;color:#9fb0c8}
+.small{font-size:0.9em;color:#aab7c6}
+.done{opacity:0.6;text-decoration:line-through}
+.pass{font-family:monospace;background:#0b0c0d;padding:6px;border-radius:6px;display:inline-block}
+a {color:#6ad1ff}
+</style>
 </head>
 <body>
-  <div class="card">
-    <h1>OPSEC Assistant</h1>
-    <p class="small">Defensive OPSEC toolkit — privacy hygiene, passphrases, encrypted notes, and threat model. Run locally. For lawful use only.</p>
-  </div>
+<div class="card">
+<h1>OPSEC Assistant iSH</h1>
+<p class="small">Lightweight privacy tool for iSH. Defensive OPSEC only.</p>
+</div>
 
-  <div class="row">
-    <div class="col card">
-      <h3>Checklist</h3>
-      <form method="POST" action="/toggle_item">
-        {% for item in checklist %}
-          <div>
-            <input type="checkbox" name="item_id" value="{{item['id']}}" {% if item['done'] %}checked{%endif%} onchange="this.form.submit()">
-            <span class="{% if item['done'] %}done{%endif%}">{{item['item']}}</span>
-          </div>
-        {% endfor %}
-      </form>
-      <form method="POST" action="/add_check">
-        <input name="new_item" placeholder="Add checklist item..." style="width:70%">
-        <button>Add</button>
-      </form>
-    </div>
+<div class="row">
+<div class="col card">
+<h3>Checklist</h3>
+<form method="POST" action="/toggle_item">
+{% for item in checklist %}
+<div>
+<input type="checkbox" name="item_id" value="{{item['id']}}" {% if item['done'] %}checked{%endif%} onchange="this.form.submit()">
+<span class="{% if item['done'] %}done{%endif%}">{{item['item']}}</span>
+</div>
+{% endfor %}
+</form>
+<form method="POST" action="/add_check">
+<input name="new_item" placeholder="Add checklist item..." style="width:70%">
+<button>Add</button>
+</form>
+</div>
 
-    <div class="col card">
-      <h3>Passphrase Generator</h3>
-      <form method="POST" action="/generate">
-        <label>Words (diceware-style)</label>
-        <input type="number" name="num_words" value="6" min="3" max="12">
-        <label>Separator</label>
-        <input name="sep" value="-">
-        <button>Generate Passphrase</button>
-      </form>
-      {% if passphrase %}
-        <p class="small">Generated passphrase:</p>
-        <div class="pass">{{passphrase}}</div>
-      {% endif %}
-      <hr>
-      <form method="POST" action="/generate_random">
-        <label>Random password length</label>
-        <input type="number" name="length" value="20" min="8" max="128">
-        <label><input type="checkbox" name="symbols" checked> Include symbols</label><br>
-        <button>Generate Random Password</button>
-      </form>
-      {% if randpass %}
-        <p class="small">Random password:</p>
-        <div class="pass">{{randpass}}</div>
-      {% endif %}
-    </div>
-  </div>
+<div class="col card">
+<h3>Passphrase Generator</h3>
+<form method="POST" action="/generate">
+<label>Words</label>
+<input type="number" name="num_words" value="6" min="3" max="12">
+<label>Separator</label>
+<input name="sep" value="-">
+<button>Generate</button>
+</form>
+{% if passphrase %}
+<p class="small">Generated:</p>
+<div class="pass">{{passphrase}}</div>
+{% endif %}
+<hr>
+<form method="POST" action="/generate_random">
+<label>Password length</label>
+<input type="number" name="length" value="20" min="8" max="128">
+<label><input type="checkbox" name="symbols" checked> Include symbols</label><br>
+<button>Generate Random</button>
+</form>
+{% if randpass %}
+<p class="small">Random password:</p>
+<div class="pass">{{randpass}}</div>
+{% endif %}
+</div>
+</div>
 
-  <div class="card">
-    <h3>Secure Notes (encrypted)</h3>
-    <form method="POST" action="/save_note">
-      <label>Title</label>
-      <input name="title" required>
-      <label>Master password (used to encrypt/decrypt notes) — keep this safe</label>
-      <input name="master" type="password" required>
-      <label>Note</label>
-      <textarea name="note" rows="4" style="width:100%"></textarea>
-      <button>Save Encrypted Note</button>
-    </form>
-    <h4>Saved Notes</h4>
-    <div class="small">To decrypt a note, enter the same master password used to encrypt it.</div>
-    <form method="POST" action="/decrypt_note" style="margin-top:8px">
-      <label>Select note</label>
-      <select name="note_id">
-        {% for n in notes %}
-          <option value="{{n['id']}}">{{n['title']}}</option>
-        {% endfor %}
-      </select>
-      <label>Master password</label>
-      <input name="master2" type="password" required>
-      <button>Decrypt</button>
-    </form>
-    {% if decrypted %}
-      <h4>Decrypted:</h4>
-      <div style="white-space:pre-wrap;background:#081018;padding:12px;border-radius:8px">{{decrypted}}</div>
-    {% endif %}
-  </div>
+<div class="card">
+<h3>Secure Notes</h3>
+<form method="POST" action="/save_note">
+<label>Title</label>
+<input name="title" required>
+<label>Master password</label>
+<input name="master" type="password" required>
+<label>Note</label>
+<textarea name="note" rows="4" style="width:100%"></textarea>
+<button>Save</button>
+</form>
 
-  <div class="card">
-    <h3>Threat Model (editable)</h3>
-    <form method="POST" action="/save_threat">
-      <textarea name="content" rows="8" style="width:100%">{{threat}}</textarea>
-      <button>Save Threat Model</button>
-    </form>
-  </div>
+<h4>Saved Notes</h4>
+<form method="POST" action="/decrypt_note">
+<label>Select note</label>
+<select name="note_id">
+{% for n in notes %}
+<option value="{{n['id']}}">{{n['title']}}</option>
+{% endfor %}
+</select>
+<label>Master password</label>
+<input name="master2" type="password" required>
+<button>Decrypt</button>
+</form>
+{% if decrypted %}
+<h4>Decrypted:</h4>
+<div style="white-space:pre-wrap;background:#081018;padding:12px;border-radius:8px">{{decrypted}}</div>
+{% endif %}
+</div>
 
-  <div class="card small">
-    <strong>Notes & safety:</strong>
-    <ul>
-      <li>This tool stores data in a local sqlite file: <code>{{db}}</code></li>
-      <li>Change the SALT constant if you want a fresh salt; do not share your master password.</li>
-      <li>For stronger production use, add rate-limiting, HTTPS, and use hardware-backed key storage.</li>
-    </ul>
-  </div>
+<div class="card">
+<h3>Threat Model</h3>
+<form method="POST" action="/save_threat">
+<textarea name="content" rows="8" style="width:100%">{{threat}}</textarea>
+<button>Save</button>
+</form>
+</div>
+
+<div class="card small">
+<strong>Notes:</strong>
+<ul>
+<li>Database: <code>{{db}}</code></li>
+<li>Keep master passwords secret.</li>
+</ul>
+</div>
+
 </body>
 </html>
 """
 
+# --- Flask Routes ---
 @app.route('/')
 def index():
     checklist = query_db("SELECT * FROM checklist")
@@ -244,20 +238,18 @@ def index():
                                   checklist=checklist,
                                   notes=notes,
                                   threat=tm['content'] if tm else "",
-                                  db=pathlib.Path(DB_PATH).absolute(),
                                   passphrase=None,
                                   randpass=None,
-                                  decrypted=None)
+                                  decrypted=None,
+                                  db=pathlib.Path(DB_PATH).absolute())
 
 @app.route('/toggle_item', methods=['POST'])
 def toggle_item():
-    # expects checkbox submission (single value)
     item_id = request.form.get('item_id')
     if item_id:
         cur = query_db("SELECT done FROM checklist WHERE id = ?", (item_id,), one=True)
         if cur:
-            new = 0 if cur['done'] else 1
-            execute_db("UPDATE checklist SET done = ? WHERE id = ?", (new, item_id))
+            execute_db("UPDATE checklist SET done = ? WHERE id = ?", (0 if cur['done'] else 1, item_id))
     return redirect(url_for('index'))
 
 @app.route('/add_check', methods=['POST'])
@@ -269,7 +261,7 @@ def add_check():
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    num = int(request.form.get('num_words', 6))
+    num = int(request.form.get('num_words',6))
     sep = request.form.get('sep','-')[:3]
     ph = generate_passphrase(num_words=num, separator=sep)
     checklist = query_db("SELECT * FROM checklist")
@@ -287,7 +279,7 @@ def generate():
 @app.route('/generate_random', methods=['POST'])
 def gen_random():
     length = int(request.form.get('length',20))
-    symbols = ('symbols' in request.form)
+    symbols = 'symbols' in request.form
     p = generate_random_password(length=length, use_symbols=symbols)
     checklist = query_db("SELECT * FROM checklist")
     notes = query_db("SELECT id,title FROM notes")
@@ -307,7 +299,7 @@ def save_note():
     master = request.form.get('master','')
     note = request.form.get('note','')
     if not master:
-        flash("Master password required to encrypt note", "error")
+        flash("Master password required", "error")
         return redirect(url_for('index'))
     blob = encrypt_note(master, note)
     execute_db("INSERT INTO notes (title, encrypted_blob) VALUES (?,?)", (title, blob))
@@ -315,7 +307,7 @@ def save_note():
     return redirect(url_for('index'))
 
 @app.route('/decrypt_note', methods=['POST'])
-def decrypt_note():
+def decrypt_note_route():
     nid = request.form.get('note_id')
     master = request.form.get('master2','')
     row = query_db("SELECT encrypted_blob FROM notes WHERE id = ?", (nid,), one=True)
@@ -326,7 +318,7 @@ def decrypt_note():
     if row:
         try:
             decrypted = decrypt_note(master, row['encrypted_blob'])
-        except Exception as e:
+        except:
             flash("Decryption failed. Check master password.", "error")
     return render_template_string(BASE_HTML,
                                   checklist=checklist,
@@ -344,7 +336,6 @@ def save_threat():
     flash("Threat model saved", "info")
     return redirect(url_for('index'))
 
-# simple API endpoint to export checklist as JSON
 @app.route('/api/export/checklist')
 def api_export():
     items = query_db("SELECT item, done FROM checklist")
@@ -354,4 +345,5 @@ def api_export():
 
 if __name__ == '__main__':
     init_db()
-    app.run(debug=True)
+    # iSH-friendly host binding
+    app.run(host="127.0.0.1", port=5000, debug=True)
